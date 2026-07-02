@@ -6,7 +6,7 @@ import { connection, coreWallet, solBalance } from './solana.js';
 import { store } from './store.js';
 import { buyToken } from './jupiter.js';
 import { burnAll } from './burn.js';
-import { perpsEnabled, openLong } from './perps.js';
+import { perpsEnabled, openLong, harvest, unrealizedPct } from './perps.js';
 
 const log = (...a) => console.log(new Date().toISOString(), '[engine]', ...a);
 
@@ -39,26 +39,58 @@ async function claimAndAllocate() {
   for (const t of active) {
     const slice = Math.floor(perpLamports / Math.max(active.length, 1));
     if (slice <= 0) continue;
+    const buybackBurn = async () => {
+      const { sig } = await buyToken(t.mint, slice);
+      await burnAll(t.mint);
+      store.recordBurn({ mint: t.mint, market: t.linked || t.underlying, side: 'long', tx: sig });
+      log('buyback+burn', t.mint, sig);
+    };
     try {
-      if (perpsEnabled()) {
-        const pos = await openLong({ market: t.underlying, collateralLamports: slice, leverage: t.leverage });
-        store.upsert(t.mint, { positionId: pos.positionId, lastEntry: Date.now() });
-        store.setPosition(t.mint, { market: t.linked || t.underlying, side: t.side || 'long', leverage: t.leverage, sizeUsd: 0, pnl: 0 });
-        log('opened perp', t.mint, pos.sig);
-      } else {
-        // safe fallback: no leverage -> buy back & burn the derivative directly
-        const { sig } = await buyToken(t.mint, slice);
-        await burnAll(t.mint);
-        store.recordBurn({ mint: t.mint, market: t.linked || t.underlying, side: 'long', tx: sig });
-        log('fallback buyback+burn', t.mint, sig);
+      if (perpsEnabled() && !t.positionId) {
+        try {
+          const pos = await openLong({ market: t.linked || t.underlying, collateralLamports: slice, leverage: t.leverage });
+          store.upsert(t.mint, { positionId: pos.simulated ? null : pos.positionId, lastSizeUsd: pos.sizeUsd || 0, lastEntry: Date.now() });
+          if (!pos.simulated) store.setPosition(t.mint, { market: t.linked || t.underlying, side: 'long', leverage: pos.leverage, sizeUsd: pos.sizeUsd || 0, pnl: 0 });
+          log('perp', pos.simulated ? 'SIMULATED (set PERPS_LIVE=true to fire)' : 'opened', t.mint, pos.sig || '(dry run)');
+          if (pos.simulated) await buybackBurn(); // dry-run mode: still do real buyback so fuel is never idle
+        } catch (perpErr) {
+          // unsupported market / sim failure / any error -> never strand fuel
+          log('perp -> fallback', t.mint, perpErr.message);
+          await buybackBurn();
+        }
+      } else if (!perpsEnabled()) {
+        await buybackBurn();
       }
-    } catch (e) { log('perp slice failed', t.mint, e.message); }
+    } catch (e) { log('slice failed', t.mint, e.message); }
+  }
+}
+
+// Harvest positions once they clear the profit threshold; realized profit -> buyback+burn.
+async function harvestGreen() {
+  if (!perpsEnabled()) return;
+  for (const t of store.all()) {
+    if (!t.positionId) continue;
+    try {
+      const pct = await unrealizedPct(t.positionId);
+      if (pct == null) continue;
+      if (t.lastSizeUsd) store.setPosition(t.mint, { market: t.linked || t.underlying, side: 'long', leverage: t.leverage, sizeUsd: t.lastSizeUsd, pnl: Math.round(t.lastSizeUsd * (pct / 100)) });
+      if (pct >= CONFIG.HARVEST_PROFIT_PCT) {
+        const res = await harvest(t.positionId);
+        log('harvest', t.mint, res.simulated ? 'SIMULATED' : res.sig, `(+${pct.toFixed(1)}%)`);
+        if (!res.simulated) {
+          store.closePosition(t.mint);
+          store.upsert(t.mint, { positionId: null });
+          // TODO: route realized USDC -> buy back & burn the derivative (needs USDC swap). Records the win for now.
+          store.recordBurn({ mint: t.mint, market: t.linked || t.underlying, side: 'long', tx: res.sig });
+        }
+      }
+    } catch (e) { log('harvest check failed', t.mint, e.message); }
   }
 }
 
 export async function tick() {
-  try { await claimAndAllocate(); }
-  catch (e) { log('tick error:', e.message); }
+  try { await claimAndAllocate(); } catch (e) { log('tick error:', e.message); }
+  try { await harvestGreen(); } catch (e) { log('harvest error:', e.message); }
 }
 
 export function startEngine() {

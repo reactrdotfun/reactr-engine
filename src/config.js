@@ -14,6 +14,11 @@ export const CONFIG = {
   PORT: num(process.env.PORT, 8080),
   CORS_ORIGIN: (process.env.CORS_ORIGIN || '*').split(',').map(s => s.trim()),
   ENABLE_PERPS: String(process.env.ENABLE_PERPS).toLowerCase() === 'true',
+  // Perp safety gates
+  PERPS_LIVE: String(process.env.PERPS_LIVE).toLowerCase() === 'true', // false => simulate only
+  PERPS_MAX_LEVERAGE: num(process.env.PERPS_MAX_LEVERAGE, 10),
+  MAX_POSITION_USD: num(process.env.MAX_POSITION_USD, 25),
+  HARVEST_PROFIT_PCT: num(process.env.HARVEST_PROFIT_PCT, 15), // close a long when unrealized >= this %
 };
 
 // Solana incinerator — tokens sent here are permanently burned/unrecoverable.
