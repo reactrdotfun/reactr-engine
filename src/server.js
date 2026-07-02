@@ -10,13 +10,56 @@ const app = express();
 app.use(express.json());
 app.use(cors({ origin: CONFIG.CORS_ORIGIN }));
 
+const shortMint = (m = '') => (m ? `${m.slice(0, 4)}…${m.slice(-4)}` : '');
+const ago = (ts) => {
+  const s = Math.max(0, Math.floor((Date.now() - ts) / 1000));
+  if (s < 60) return `${s}s ago`;
+  if (s < 3600) return `${Math.floor(s / 60)}m ago`;
+  if (s < 86400) return `${Math.floor(s / 3600)}h ago`;
+  return `${Math.floor(s / 86400)}d ago`;
+};
+
 app.get('/health', (_req, res) => res.json({ ok: true, ts: Date.now() }));
 
-// Aggregate metrics for the site (telemetry + dashboard)
+// Aggregate metrics → { reactions, pnl, burned, buybacks }
 app.get('/api/v1/stats', (_req, res) => res.json(store.stats()));
 
-// All registered tokens (dashboard grid)
-app.get('/api/v1/tokens', (_req, res) => res.json(store.all()));
+// All registered tokens, shaped for the dashboard + leaderboard
+app.get('/api/v1/tokens', (_req, res) =>
+  res.json(store.all().map((t) => ({
+    name: t.name || shortMint(t.mint),
+    linked: t.linked || t.underlying || 'SOL',
+    side: t.side || 'long',
+    leverage: t.leverage || 100,
+    status: t.status || 'pending',
+    pnl: t.pnl || 0,
+    sizeUsd: t.sizeUsd || 0,
+    mint: t.mint,
+  })))
+);
+
+// Open perpetual positions → { market, side, leverage, sizeUsd, pnl }
+app.get('/api/v1/positions', (_req, res) =>
+  res.json(store.positions().map((p) => ({
+    market: p.market || p.linked || 'SOL',
+    side: p.side || 'long',
+    leverage: p.leverage || 100,
+    sizeUsd: p.sizeUsd || 0,
+    pnl: p.pnl || 0,
+  })))
+);
+
+// Recent buybacks & burns → { time, market, side, size, result, tx }
+app.get('/api/v1/history', (_req, res) =>
+  res.json(store.history().map((h) => ({
+    time: ago(h.ts),
+    market: h.market,
+    side: h.side || 'long',
+    size: h.size || 0,
+    result: h.result || 0,
+    tx: h.tx || '',
+  })))
+);
 
 // One token's status + position
 app.get('/api/v1/tokens/:mint/status', (req, res) => {
@@ -25,10 +68,10 @@ app.get('/api/v1/tokens/:mint/status', (req, res) => {
   res.json(t);
 });
 
-// Register a token
+// Register a token with the core
 app.post('/api/v1/tokens/register', async (req, res) => {
   try {
-    const { mint, underlying = 'SOL', side = 'long', leverage = 100 } = req.body || {};
+    const { mint, name, underlying = 'SOL', linked, side = 'long', leverage = 100 } = req.body || {};
     if (!isValidMint(mint)) return res.status(400).json({ error: 'invalid_mint' });
     if (store.get(mint)) return res.status(409).json({ error: 'already_registered' });
 
@@ -37,8 +80,15 @@ app.post('/api/v1/tokens/register', async (req, res) => {
     if (!v.ok) return res.status(422).json({ error: 'verification_failed', ...v });
 
     const token = store.upsert(mint, {
-      underlying, side, leverage: Number(leverage),
-      status: 'active', registeredAt: Date.now(), checks: v.checks,
+      name: name || shortMint(mint),
+      linked: linked || underlying,
+      side,
+      leverage: Number(leverage),
+      status: 'active',
+      pnl: 0,
+      sizeUsd: 0,
+      registeredAt: Date.now(),
+      checks: v.checks,
     });
     res.json({ ok: true, token });
   } catch (e) {
@@ -48,7 +98,6 @@ app.post('/api/v1/tokens/register', async (req, res) => {
 
 app.listen(CONFIG.PORT, () => {
   console.log(`[api] listening on :${CONFIG.PORT}`);
-  // run the engine in the same process (or run `npm run worker` separately)
   if (process.env.RUN_ENGINE !== 'false') {
     try { startEngine(); } catch (e) { console.error('[engine] not started:', e.message); }
   }

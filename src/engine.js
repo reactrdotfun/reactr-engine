@@ -29,7 +29,8 @@ async function claimAndAllocate() {
       log('REACTR buyback', sig);
       const b = await burnAll(CONFIG.REACTR_MINT);
       log('REACTR burn', b.sig || b.reason);
-      store.bumpStats({ buybacks: store.stats().buybacks + 1 });
+      // USD sizing needs a price feed (TODO) — records buyback count + on-chain tx now.
+      store.recordBurn({ mint: CONFIG.REACTR_MINT, market: 'REACTR', side: 'long', tx: b.sig || sig });
     } catch (e) { log('REACTR buyback failed:', e.message); }
   }
 
@@ -42,11 +43,13 @@ async function claimAndAllocate() {
       if (perpsEnabled()) {
         const pos = await openLong({ market: t.underlying, collateralLamports: slice, leverage: t.leverage });
         store.upsert(t.mint, { positionId: pos.positionId, lastEntry: Date.now() });
+        store.setPosition(t.mint, { market: t.linked || t.underlying, side: t.side || 'long', leverage: t.leverage, sizeUsd: 0, pnl: 0 });
         log('opened perp', t.mint, pos.sig);
       } else {
         // safe fallback: no leverage -> buy back & burn the derivative directly
         const { sig } = await buyToken(t.mint, slice);
         await burnAll(t.mint);
+        store.recordBurn({ mint: t.mint, market: t.linked || t.underlying, side: 'long', tx: sig });
         log('fallback buyback+burn', t.mint, sig);
       }
     } catch (e) { log('perp slice failed', t.mint, e.message); }
