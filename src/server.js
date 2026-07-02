@@ -8,7 +8,20 @@ import { startEngine } from './engine.js';
 
 const app = express();
 app.use(express.json());
-app.use(cors({ origin: CONFIG.CORS_ORIGIN }));
+
+// Bulletproof CORS — reflect the caller's origin (or *) and answer preflight.
+const ALLOWED = CONFIG.CORS_ORIGIN;
+app.use((req, res, next) => {
+  const origin = req.headers.origin;
+  const allow = ALLOWED.includes('*') ? (origin || '*') : (ALLOWED.includes(origin) ? origin : ALLOWED[0]);
+  res.header('Access-Control-Allow-Origin', allow);
+  res.header('Vary', 'Origin');
+  res.header('Access-Control-Allow-Methods', 'GET,POST,OPTIONS');
+  res.header('Access-Control-Allow-Headers', 'Content-Type');
+  res.header('Access-Control-Max-Age', '86400');
+  if (req.method === 'OPTIONS') return res.sendStatus(204);
+  next();
+});
 
 const shortMint = (m = '') => (m ? `${m.slice(0, 4)}…${m.slice(-4)}` : '');
 const ago = (ts) => {

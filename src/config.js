@@ -3,7 +3,7 @@ import 'dotenv/config';
 const num = (v, d) => (v === undefined || v === '' ? d : Number(v));
 
 export const CONFIG = {
-  RPC_URL: process.env.RPC_URL || '',
+  RPC_URL: (process.env.RPC_URL && process.env.RPC_URL.startsWith('http')) ? process.env.RPC_URL : 'https://api.mainnet-beta.solana.com',
   CORE_WALLET_SECRET: process.env.CORE_WALLET_SECRET || '',
   REACTR_MINT: process.env.REACTR_MINT || '',
   FEE_CLAIM_THRESHOLD_SOL: num(process.env.FEE_CLAIM_THRESHOLD_SOL, 0.05),
