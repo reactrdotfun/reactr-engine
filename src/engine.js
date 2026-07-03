@@ -36,7 +36,11 @@ async function claimAndAllocate() {
   }
 
   // 70% -> perp collateral (or fallback to derivative buyback if perps disabled)
-  const active = store.all().filter(t => t.status === 'active');
+  let active = store.all().filter(t => t.status === 'active');
+  if (CONFIG.PERPS_TEST_SINGLE && active.length > 1) {
+    active = [active[0]];
+    log('PERPS_TEST_SINGLE: routing full 70% slice to', active[0].mint);
+  }
   for (const t of active) {
     const slice = Math.floor(perpLamports / Math.max(active.length, 1));
     if (slice <= 0) continue;

@@ -24,6 +24,9 @@ export const CONFIG = {
   // BURN_ENABLED=false -> engine skips ALL buyback/burn spending (REACTR + fallbacks)
   // but still runs perp attempts (dry-run or live). For testing perps in isolation.
   BURN_ENABLED: String(process.env.BURN_ENABLED ?? 'true').toLowerCase() !== 'false',
+  // PERPS_TEST_SINGLE=true -> don't split the 70% across tokens; send it all as ONE
+  // slice to the first active token. For testing perps with a small balance.
+  PERPS_TEST_SINGLE: String(process.env.PERPS_TEST_SINGLE).toLowerCase() === 'true',
   SWEEP_DESTINATION: process.env.SWEEP_DESTINATION || '',
 };
 
