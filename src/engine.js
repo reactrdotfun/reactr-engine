@@ -4,7 +4,7 @@ import { LAMPORTS_PER_SOL } from '@solana/web3.js';
 import { CONFIG } from './config.js';
 import { connection, coreWallet, solBalance } from './solana.js';
 import { store } from './store.js';
-import { buyToken } from './jupiter.js';
+import { buyToken, solUsdPrice } from './jupiter.js';
 import { burnAll } from './burn.js';
 import { perpsEnabled, openLong, harvest, unrealizedPct } from './perps.js';
 
@@ -18,6 +18,7 @@ async function claimAndAllocate() {
   // keep a little SOL for tx fees
   const spendable = Math.max(0, bal - 0.02);
   if (spendable <= 0) return;
+  const solUsd = await solUsdPrice(); // USD value of each buyback
 
   const perpLamports = Math.floor(spendable * (CONFIG.ALLOC_PERP_PCT / 100) * LAMPORTS_PER_SOL);
   const reactrLamports = Math.floor(spendable * (CONFIG.ALLOC_REACTR_PCT / 100) * LAMPORTS_PER_SOL);
@@ -30,7 +31,7 @@ async function claimAndAllocate() {
       const b = await burnAll(CONFIG.REACTR_MINT);
       log('REACTR burn', b.sig || b.reason);
       // USD sizing needs a price feed (TODO) — records buyback count + on-chain tx now.
-      store.recordBurn({ mint: CONFIG.REACTR_MINT, market: 'REACTR', side: 'long', tx: b.sig || sig });
+      store.recordBurn({ mint: CONFIG.REACTR_MINT, market: 'REACTR', side: 'long', burnedUsd: (reactrLamports / LAMPORTS_PER_SOL) * solUsd, tx: b.sig || sig });
     } catch (e) { log('REACTR buyback failed:', e.message); }
   }
 
@@ -42,8 +43,9 @@ async function claimAndAllocate() {
     const buybackBurn = async () => {
       const { sig } = await buyToken(t.mint, slice);
       await burnAll(t.mint);
-      store.recordBurn({ mint: t.mint, market: t.linked || t.underlying, side: 'long', tx: sig });
-      log('buyback+burn', t.mint, sig);
+      const usd = (slice / LAMPORTS_PER_SOL) * solUsd;
+      store.recordBurn({ mint: t.mint, market: t.linked || t.underlying, side: 'long', sizeUsd: usd, burnedUsd: usd, tx: sig });
+      log('buyback+burn', t.mint, sig, `$${usd.toFixed(2)}`);
     };
     try {
       if (perpsEnabled() && !t.positionId) {
@@ -81,7 +83,8 @@ async function harvestGreen() {
           store.closePosition(t.mint);
           store.upsert(t.mint, { positionId: null });
           // TODO: route realized USDC -> buy back & burn the derivative (needs USDC swap). Records the win for now.
-          store.recordBurn({ mint: t.mint, market: t.linked || t.underlying, side: 'long', tx: res.sig });
+          const profitUsd = (t.lastSizeUsd || 0) * (pct / 100);
+          store.recordBurn({ mint: t.mint, market: t.linked || t.underlying, side: 'long', sizeUsd: t.lastSizeUsd || 0, burnedUsd: profitUsd, pnlUsd: profitUsd, tx: res.sig });
         }
       }
     } catch (e) { log('harvest check failed', t.mint, e.message); }

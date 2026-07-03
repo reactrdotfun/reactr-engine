@@ -57,12 +57,12 @@ export const store = {
   },
 
   // Record a completed buyback+burn: updates global stats, token pnl, and history
-  recordBurn({ mint, market, side = 'long', sizeUsd = 0, resultUsd = 0, tx = '' }) {
+  recordBurn({ mint, market, side = 'long', sizeUsd = 0, burnedUsd = 0, pnlUsd = 0, tx = '' }) {
     db.stats.buybacks = (db.stats.buybacks || 0) + 1;
-    db.stats.burnedUsd = (db.stats.burnedUsd || 0) + Math.max(0, resultUsd);
-    db.stats.netPnlUsd = (db.stats.netPnlUsd || 0) + resultUsd;
-    if (mint && db.tokens[mint]) db.tokens[mint].pnl = (db.tokens[mint].pnl || 0) + resultUsd;
-    db.history.unshift({ ts: Date.now(), market, side, size: sizeUsd, result: resultUsd, tx });
+    db.stats.burnedUsd = (db.stats.burnedUsd || 0) + Math.max(0, burnedUsd);
+    db.stats.netPnlUsd = (db.stats.netPnlUsd || 0) + pnlUsd;
+    if (mint && db.tokens[mint]) db.tokens[mint].pnl = (db.tokens[mint].pnl || 0) + pnlUsd;
+    db.history.unshift({ ts: Date.now(), market, side, size: sizeUsd || burnedUsd, result: burnedUsd || pnlUsd, tx });
     db.history = db.history.slice(0, 50);
     persist();
   },
