@@ -21,6 +21,9 @@ export const CONFIG = {
   HARVEST_PROFIT_PCT: num(process.env.HARVEST_PROFIT_PCT, 15), // close a long when unrealized >= this %
   // Sweep / withdraw mode — sells all held tokens to SOL and sends it to SWEEP_DESTINATION.
   SWEEP_MODE: String(process.env.SWEEP_MODE).toLowerCase() === 'true',
+  // BURN_ENABLED=false -> engine skips ALL buyback/burn spending (REACTR + fallbacks)
+  // but still runs perp attempts (dry-run or live). For testing perps in isolation.
+  BURN_ENABLED: String(process.env.BURN_ENABLED ?? 'true').toLowerCase() !== 'false',
   SWEEP_DESTINATION: process.env.SWEEP_DESTINATION || '',
 };
 

@@ -24,7 +24,7 @@ async function claimAndAllocate() {
   const reactrLamports = Math.floor(spendable * (CONFIG.ALLOC_REACTR_PCT / 100) * LAMPORTS_PER_SOL);
 
   // 30% -> straight $REACTR buyback + burn
-  if (reactrLamports > 0 && CONFIG.REACTR_MINT) {
+  if (reactrLamports > 0 && CONFIG.REACTR_MINT && CONFIG.BURN_ENABLED) {
     try {
       const { sig } = await buyToken(CONFIG.REACTR_MINT, reactrLamports);
       log('REACTR buyback', sig);
@@ -41,6 +41,7 @@ async function claimAndAllocate() {
     const slice = Math.floor(perpLamports / Math.max(active.length, 1));
     if (slice <= 0) continue;
     const buybackBurn = async () => {
+      if (!CONFIG.BURN_ENABLED) { log('burn disabled (BURN_ENABLED=false) — skipping buyback', t.mint); return; }
       const { sig } = await buyToken(t.mint, slice);
       const b = await burnAll(t.mint);
       log('burn', t.mint, b.sig || b.reason, b.error || '');
