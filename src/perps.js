@@ -53,7 +53,8 @@ async function getProgram() {
   const provider = new AnchorProvider(connection, new Wallet(coreWallet()), { commitment: 'confirmed' });
   const idl = await Program.fetchIdl(PERPS_PROGRAM, provider);
   if (!idl) throw new Error('could not fetch Jupiter Perps IDL from chain');
-  _program = new Program(idl, PERPS_PROGRAM, provider);
+  idl.address = idl.address || PERPS_PROGRAM.toBase58(); // anchor 0.30 takes programId from the IDL
+  _program = new Program(idl, provider);
   return _program;
 }
 
@@ -74,7 +75,7 @@ async function getAccounts() {
 
 async function usdPrice(mint) {
   // Jupiter price API (public). Returns USD price for the mint.
-  const r = await fetch(`https://price.jup.ag/v6/price?ids=${mint}`);
+  const r = await fetch(`https://lite-api.jup.ag/price/v2?ids=${mint}`);
   if (!r.ok) throw new Error(`price api ${r.status}`);
   const j = await r.json();
   const price = j?.data?.[mint]?.price;
