@@ -6,17 +6,16 @@ import { connection, coreWallet } from './solana.js';
 const JUP = 'https://lite-api.jup.ag/swap/v1';
 const SOL_MINT = 'So11111111111111111111111111111111111111112';
 
-// Cached SOL price in USD (Jupiter price API). Used to value buybacks/burns.
+// Cached SOL price in USD. Derived from a SOL->USDC quote (same API the buybacks
+// already use successfully), so it works even when the price API is down.
 let _sol = { v: 0, t: 0 };
 export async function solUsdPrice() {
   if (_sol.v && Date.now() - _sol.t < 60000) return _sol.v;
   try {
-    const r = await fetch(`https://lite-api.jup.ag/price/v2?ids=${SOL_MINT}`);
-    if (r.ok) {
-      const j = await r.json();
-      const p = Number(j?.data?.[SOL_MINT]?.price || 0);
-      if (p > 0) _sol = { v: p, t: Date.now() };
-    }
+    const USDC = 'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v';
+    const q = await getQuote(SOL_MINT, USDC, 1_000_000_000); // 1 SOL -> USDC (6 decimals)
+    const out = Number(q.outAmount) / 1e6;
+    if (out > 0) _sol = { v: out, t: Date.now() };
   } catch (e) { /* keep last known */ }
   return _sol.v || 0;
 }
