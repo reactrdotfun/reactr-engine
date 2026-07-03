@@ -1,259 +1,170 @@
 /**
- * PERP ADAPTER — Jupiter Perpetuals (real integration, simulate-first).
+ * PERP ADAPTER — Jupiter Perpetuals via the OFFICIAL REST API.
  * ---------------------------------------------------------------------------
- * WHAT WORKS:
- *   - Jupiter Perps only lists SOL / ETH / wBTC. There are NO perps for memecoins
- *     (BONK/WIF/JUP/etc.) — for those markets the engine falls back to buyback+burn.
- *   - Max leverage is ~100x (not 250x). We cap at PERPS_MAX_LEVERAGE.
- *   - Positions are opened via a request the Jupiter keeper executes (not a swap).
+ * Jupiter provides a hosted API that builds the transaction server-side:
+ *   POST https://perps-api.jup.ag/v2/positions/increase  -> serializedTxBase64
+ *   sign locally with the core wallet
+ *   POST https://perps-api.jup.ag/v1/transaction/execute -> txid (Jupiter lands it)
  *
- * SAFETY MODEL (read before enabling):
- *   1. ENABLE_PERPS=false  -> adapter never runs; engine buys back & burns directly.
- *   2. ENABLE_PERPS=true + PERPS_LIVE=false (DEFAULT) -> builds the real tx and
- *      SIMULATES it on the RPC. Nothing is sent. Returns the simulation result.
- *      Use this to validate the integration against the live on-chain IDL.
- *   3. PERPS_LIVE=true -> actually sends. Only flip this after simulation passes
- *      AND you've tested with a tiny MAX_POSITION_USD on mainnet.
+ * No Anchor, no IDL, no PDA math — the API returns a ready transaction.
+ * This is the same flow jup.ag's own frontend uses.
  *
- * The instruction encoding is built from the program's ON-CHAIN IDL (fetched at
- * runtime via Anchor), so encoding is correct-by-construction. The PDA seeds and
- * account names below match Jupiter Perps at time of writing — if a simulation
- * fails with an account/seed error, log `Object.keys(program.methods)` and the
- * IDL accounts and adjust. This is expected iteration for a live integration.
- *
- * Docs: https://station.jup.ag/guides/perpetual-exchange/onchain-accounts
+ * SAFETY:
+ *   - PERPS_LIVE=false -> builds the real tx via the API but does NOT execute.
+ *     (validates the whole path except the final send)
+ *   - PERPS_LIVE=true  -> executes for real.
+ *   - Markets: SOL / ETH / BTC only (Jupiter Perps listing).
+ *   - Leverage capped by PERPS_MAX_LEVERAGE, size capped by MAX_POSITION_USD.
  */
-import { PublicKey, ComputeBudgetProgram, TransactionMessage, VersionedTransaction } from '@solana/web3.js';
-import { getAssociatedTokenAddressSync, TOKEN_PROGRAM_ID, ASSOCIATED_TOKEN_PROGRAM_ID, getMint } from '@solana/spl-token';
-import anchor from '@coral-xyz/anchor';
-const { AnchorProvider, Program, BN, Wallet } = anchor;
+import { VersionedTransaction } from '@solana/web3.js';
 import { CONFIG } from './config.js';
-import { connection, coreWallet } from './solana.js';
-import { getQuote } from './jupiter.js';
+import { coreWallet } from './solana.js';
+import { solUsdPrice } from './jupiter.js';
+
+const API = 'https://perps-api.jup.ag';
+const MARKETS = ['SOL', 'ETH', 'BTC', 'WBTC'];
 
 export function perpsEnabled() { return CONFIG.ENABLE_PERPS; }
 
-const PERPS_PROGRAM = new PublicKey('PERPHjGBqRHArX4DySjwM6UJHiR3sWAatqfdBS2qQJu');
-const USDC_MINT = new PublicKey('EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v');
-
-// Jupiter Perps supported markets → underlying mint (collateral is USDC).
-const MARKETS = {
-  SOL: new PublicKey('So11111111111111111111111111111111111111112'),
-  ETH: new PublicKey('7vfCXTUXx5WJV5JADk17DUJ4ksgau7utNKj4b963voxs'), // Wormhole ETH
-  BTC: new PublicKey('3NZ9JMVBmGAqocybic2c7LQCJScmgsAZ6vQqTDzcqmJh'), // Wormhole wBTC
-  WBTC: new PublicKey('3NZ9JMVBmGAqocybic2c7LQCJScmgsAZ6vQqTDzcqmJh'),
-};
-
-const SIDE_LONG = 1; // 1 = long, 2 = short (Jupiter perps enum)
-
-let _program = null;
-let _accts = null;
-
-async function getProgram() {
-  if (_program) return _program;
-  const provider = new AnchorProvider(connection, new Wallet(coreWallet()), { commitment: 'confirmed' });
-  const idl = await Program.fetchIdl(PERPS_PROGRAM, provider);
-  if (!idl) throw new Error('could not fetch Jupiter Perps IDL from chain');
-  _program = new Program(idl, PERPS_PROGRAM, provider); // anchor 0.29: (idl, programId, provider)
-  return _program;
+function normMarket(sym) {
+  const s = String(sym || '').toUpperCase();
+  if (s === 'WBTC') return 'BTC';
+  return MARKETS.includes(s) ? s : null;
 }
 
-// Discover pool / perpetuals / custodies from chain instead of hardcoding addresses.
-async function getAccounts() {
-  if (_accts) return _accts;
-  const p = await getProgram();
-  const [perpetuals] = PublicKey.findProgramAddressSync([Buffer.from('perpetuals')], PERPS_PROGRAM);
-  const pools = await p.account.pool.all();
-  if (!pools.length) throw new Error('no Jupiter pool found');
-  const pool = pools[0].publicKey; // JLP pool
-  const custodies = await p.account.custody.all();
-  const byMint = {};
-  for (const c of custodies) byMint[c.account.mint.toBase58()] = { pubkey: c.publicKey, oracle: c.account.oracle?.oracleAccount || c.account.oracle };
-  _accts = { perpetuals, pool, byMint };
-  return _accts;
+async function jfetch(url, opts) {
+  const r = await fetch(url, opts);
+  const j = await r.json().catch(() => ({}));
+  return { ok: r.ok, status: r.status, data: j };
 }
 
-async function usdPrice(mint) {
-  // Derive USD price via a quote of 1 whole token -> USDC (price API returns 404).
-  const dec = (await getMint(connection, new PublicKey(mint))).decimals;
-  const q = await getQuote(mint, USDC_MINT.toBase58(), 10 ** dec);
-  const price = Number(q.outAmount) / 1e6;
-  if (!price) throw new Error('no price for ' + mint);
-  return price;
-}
+/**
+ * Open a leveraged long via the Jupiter Perps API.
+ * Returns { sig|null, positionId, sizeUsd, leverage, simulated }.
+ * Throws for unsupported markets / API errors so the engine can fall back.
+ */
+export async function openLong({ market, collateralLamports, leverage }) {
+  const asset = normMarket(market);
+  if (!asset) throw new Error(`market ${market} not on Jupiter Perps (SOL/ETH/BTC) — fallback`);
 
-function marketMint(sym) {
-  const m = MARKETS[String(sym).toUpperCase()];
-  return m || null;
-}
-
-async function buildAndRun(ixs, label) {
   const wallet = coreWallet();
-  const { blockhash } = await connection.getLatestBlockhash('confirmed');
-  const msg = new TransactionMessage({
-    payerKey: wallet.publicKey,
-    recentBlockhash: blockhash,
-    instructions: [ComputeBudgetProgram.setComputeUnitLimit({ units: 400000 }), ...ixs],
-  }).compileToV0Message();
-  const tx = new VersionedTransaction(msg);
+  const lev = Math.max(1.1, Math.min(Number(leverage) || 2, CONFIG.PERPS_MAX_LEVERAGE));
+
+  // Cap collateral so position size <= MAX_POSITION_USD
+  const solUsd = await solUsdPrice();
+  if (!solUsd) throw new Error('no SOL price — fallback');
+  let collateralUsd = (collateralLamports / 1e9) * solUsd;
+  const maxCollateralUsd = CONFIG.MAX_POSITION_USD / lev;
+  if (collateralUsd > maxCollateralUsd) {
+    collateralUsd = maxCollateralUsd;
+    collateralLamports = Math.floor((collateralUsd / solUsd) * 1e9);
+  }
+  const sizeUsd = collateralUsd * lev;
+  if (sizeUsd < 10) throw new Error(`position $${sizeUsd.toFixed(2)} below $10 min — fallback`);
+
+  // 1) ask Jupiter to build the increase-position transaction
+  const { ok, status, data } = await jfetch(`${API}/v2/positions/increase`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      asset,
+      inputToken: asset,                      // long: collateral in the asset itself (SOL)
+      inputTokenAmount: String(collateralLamports),
+      leverage: lev.toFixed(1),
+      side: 'long',
+      walletAddress: wallet.publicKey.toBase58(),
+      maxSlippageBps: '300',
+    }),
+  });
+  if (!ok || !data.serializedTxBase64) {
+    throw new Error(`jup perps api ${status}: ${data.message || JSON.stringify(data).slice(0, 120)}`);
+  }
+
+  // 2) sign locally
+  const tx = VersionedTransaction.deserialize(Buffer.from(data.serializedTxBase64, 'base64'));
   tx.sign([wallet]);
 
-  // SIMULATE-FIRST gate — nothing is sent unless PERPS_LIVE=true.
+  // SAFETY GATE — dry run stops here (the API accepted our request & built a real tx)
   if (!CONFIG.PERPS_LIVE) {
-    const sim = await connection.simulateTransaction(tx, { sigVerify: false });
-    if (sim.value.err) {
-      console.error(`[perps:sim] ${label} FAILED`, JSON.stringify(sim.value.err), sim.value.logs?.slice(-6));
-      throw new Error(`perps simulation failed (${label}) — see logs`);
-    }
-    console.log(`[perps:sim] ${label} OK (dry run — set PERPS_LIVE=true to fire)`);
+    console.log(`[perps] DRY RUN ok — ${asset} long ${lev}x $${sizeUsd.toFixed(0)} (set PERPS_LIVE=true to execute)`);
+    return { sig: null, positionId: null, sizeUsd, leverage: lev, simulated: true };
+  }
+
+  // 3) execute via Jupiter's landing infra
+  const exec = await jfetch(`${API}/v1/transaction/execute`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      action: 'increase-position',
+      serializedTxBase64: Buffer.from(tx.serialize()).toString('base64'),
+    }),
+  });
+  if (!exec.data.txid) throw new Error(`jup execute failed: ${exec.data.message || JSON.stringify(exec.data).slice(0, 120)}`);
+
+  return { sig: exec.data.txid, positionId: `${asset}:long`, sizeUsd, leverage: lev, simulated: false };
+}
+
+/** Current open positions for the core wallet (from Jupiter's API). */
+export async function fetchPositions() {
+  const wallet = coreWallet();
+  const { data } = await jfetch(`${API}/v1/positions?walletAddress=${wallet.publicKey.toBase58()}`);
+  return data.dataList || [];
+}
+
+/** Unrealized PnL % for the position on `positionId` ("ASSET:side"). */
+export async function unrealizedPct(positionId) {
+  const [asset] = String(positionId).split(':');
+  const list = await fetchPositions();
+  const pos = list.find(p => (p.asset || p.marketMint || '').toUpperCase().includes(asset)) || list[0];
+  if (!pos) return null;
+  const pnl = parseFloat(pos.pnlAfterFeesUsd ?? pos.pnlUsd ?? 'NaN');
+  const collateral = parseFloat(pos.collateralUsd ?? 'NaN');
+  if (Number.isNaN(pnl) || Number.isNaN(collateral) || !collateral) return null;
+  return (pnl / collateral) * 100;
+}
+
+/** Close the position fully. Returns { sig, simulated }. */
+export async function harvest(positionId) {
+  const wallet = coreWallet();
+  const list = await fetchPositions();
+  const [asset] = String(positionId).split(':');
+  const pos = list.find(p => (p.asset || '').toUpperCase().includes(asset)) || list[0];
+  if (!pos) throw new Error('position not found (already closed?)');
+
+  const { ok, status, data } = await jfetch(`${API}/v1/positions/decrease`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      asset: pos.asset || asset,
+      desiredMint: 'So11111111111111111111111111111111111111112', // receive SOL
+      collateralUsdDelta: pos.collateralUsd,
+      sizeUsdDelta: pos.sizeUsdDelta ?? pos.sizeUsd,
+      positionPubkey: pos.positionPubkey,
+      side: pos.side || 'long',
+      walletAddress: wallet.publicKey.toBase58(),
+      maxSlippageBps: '500',
+    }),
+  });
+  if (!ok || !data.serializedTxBase64) {
+    throw new Error(`jup close api ${status}: ${data.message || JSON.stringify(data).slice(0, 120)}`);
+  }
+
+  const tx = VersionedTransaction.deserialize(Buffer.from(data.serializedTxBase64, 'base64'));
+  tx.sign([wallet]);
+
+  if (!CONFIG.PERPS_LIVE) {
+    console.log(`[perps] DRY RUN close ok — ${asset} (set PERPS_LIVE=true to execute)`);
     return { sig: null, simulated: true };
   }
 
-  const sig = await connection.sendRawTransaction(tx.serialize(), { maxRetries: 3 });
-  await connection.confirmTransaction(sig, 'confirmed');
-  return { sig, simulated: false };
-}
-
-/**
- * Open a leveraged long. Returns { sig|null, positionId, simulated }.
- * Throws for unsupported markets so the engine can fall back to buyback.
- */
-export async function openLong({ market, collateralLamports, leverage }) {
-  const mint = marketMint(market);
-  if (!mint) throw new Error(`market ${market} not tradable on Jupiter Perps (SOL/ETH/BTC only) — fallback`);
-
-  const lev = Math.min(Number(leverage) || 2, CONFIG.PERPS_MAX_LEVERAGE);
-  const wallet = coreWallet();
-  const p = await getProgram();
-  const { perpetuals, pool, byMint } = await getAccounts();
-
-  const custody = byMint[mint.toBase58()];
-  const collateralCustody = byMint[USDC_MINT.toBase58()];
-  if (!custody || !collateralCustody) throw new Error('custody not found for market/collateral — fallback');
-
-  // Size the position in USD, capped by MAX_POSITION_USD.
-  const solUsd = await usdPrice(MARKETS.SOL.toBase58());
-  const collateralUsd = Math.min((collateralLamports / 1e9) * solUsd, CONFIG.MAX_POSITION_USD);
-  if (collateralUsd < 10) throw new Error('collateral below $10 min — fallback');
-  const sizeUsd = collateralUsd * lev;
-
-  // 6-decimal USD fixed point used by the program.
-  const sizeUsdDelta = new BN(Math.floor(sizeUsd * 1e6));
-  const collateralUsdc = new BN(Math.floor(collateralUsd * 1e6)); // USDC has 6 decimals
-
-  const [position] = PublicKey.findProgramAddressSync(
-    [Buffer.from('position'), wallet.publicKey.toBuffer(), pool.toBuffer(), custody.pubkey.toBuffer(), collateralCustody.pubkey.toBuffer(), Buffer.from([SIDE_LONG])],
-    PERPS_PROGRAM,
-  );
-  const counter = new BN(Date.now());
-  const [positionRequest] = PublicKey.findProgramAddressSync(
-    [Buffer.from('position_request'), position.toBuffer(), counter.toArrayLike(Buffer, 'le', 8), Buffer.from([1])],
-    PERPS_PROGRAM,
-  );
-  const positionRequestAta = getAssociatedTokenAddressSync(USDC_MINT, positionRequest, true);
-  const fundingAccount = getAssociatedTokenAddressSync(USDC_MINT, wallet.publicKey);
-  const [eventAuthority] = PublicKey.findProgramAddressSync([Buffer.from('__event_authority')], PERPS_PROGRAM);
-
-  const ix = await p.methods
-    .createIncreasePositionMarketRequest({
-      sizeUsdDelta,
-      collateralTokenDelta: collateralUsdc,
-      side: SIDE_LONG,
-      priceSlippage: new BN(0),
-      jupiterMinimumOut: null,
-      counter,
-    })
-    .accounts({
-      owner: wallet.publicKey,
-      fundingAccount,
-      perpetuals,
-      pool,
-      position,
-      positionRequest,
-      positionRequestAta,
-      custody: custody.pubkey,
-      collateralCustody: collateralCustody.pubkey,
-      inputMint: USDC_MINT,
-      tokenProgram: TOKEN_PROGRAM_ID,
-      associatedTokenProgram: ASSOCIATED_TOKEN_PROGRAM_ID,
-      systemProgram: PublicKey.default,
-      eventAuthority,
-      program: PERPS_PROGRAM,
-    })
-    .instruction();
-
-  const res = await buildAndRun([ix], `openLong ${market} ${lev}x $${sizeUsd.toFixed(0)}`);
-  return { ...res, positionId: position.toBase58(), sizeUsd, leverage: lev };
-}
-
-/**
- * Unrealized price move % for a long position (leverage amplifies actual PnL).
- * Field names assume Jupiter Perps' position layout — verify against the live IDL.
- * Returns null if it can't be read (engine then leaves the position open).
- */
-export async function unrealizedPct(positionId) {
-  const p = await getProgram();
-  const pos = await p.account.position.fetch(new PublicKey(positionId)).catch(() => null);
-  if (!pos || !pos.sizeUsd || pos.sizeUsd.isZero?.()) return null;
-  const { byMint } = await getAccounts();
-  let mktMint = null;
-  for (const [mintStr, c] of Object.entries(byMint)) if (c.pubkey.equals(pos.custody)) mktMint = mintStr;
-  if (!mktMint) return null;
-  const entry = Number(pos.price) / 1e6; // entry price, 6dp
-  if (!entry) return null;
-  const cur = await usdPrice(mktMint);
-  return ((cur - entry) / entry) * 100; // price move %; long
-}
-
-/**
- * Close / harvest a position by its PDA (positionId from openLong).
- * Builds a full-size decrease request. Returns { sig|null, simulated }.
- */
-export async function harvest(positionId) {
-  const wallet = coreWallet();
-  const p = await getProgram();
-  const { perpetuals, pool } = await getAccounts();
-  const position = new PublicKey(positionId);
-  const pos = await p.account.position.fetch(position).catch(() => null);
-  if (!pos) throw new Error('position not found (already closed?)');
-
-  const counter = new BN(Date.now());
-  const [positionRequest] = PublicKey.findProgramAddressSync(
-    [Buffer.from('position_request'), position.toBuffer(), counter.toArrayLike(Buffer, 'le', 8), Buffer.from([2])],
-    PERPS_PROGRAM,
-  );
-  const desiredMint = USDC_MINT;
-  const positionRequestAta = getAssociatedTokenAddressSync(desiredMint, positionRequest, true);
-  const receivingAccount = getAssociatedTokenAddressSync(desiredMint, wallet.publicKey);
-  const [eventAuthority] = PublicKey.findProgramAddressSync([Buffer.from('__event_authority')], PERPS_PROGRAM);
-
-  const ix = await p.methods
-    .createDecreasePositionMarketRequest({
-      collateralUsdDelta: new BN(0),
-      sizeUsdDelta: pos.sizeUsd, // full close
-      priceSlippage: new BN(0),
-      jupiterMinimumOut: null,
-      entirePosition: true,
-      counter,
-    })
-    .accounts({
-      owner: wallet.publicKey,
-      receivingAccount,
-      perpetuals,
-      pool,
-      position,
-      positionRequest,
-      positionRequestAta,
-      custody: pos.custody,
-      collateralCustody: pos.collateralCustody,
-      desiredMint,
-      tokenProgram: TOKEN_PROGRAM_ID,
-      associatedTokenProgram: ASSOCIATED_TOKEN_PROGRAM_ID,
-      systemProgram: PublicKey.default,
-      eventAuthority,
-      program: PERPS_PROGRAM,
-    })
-    .instruction();
-
-  return buildAndRun([ix], `harvest ${positionId.slice(0, 6)}`);
+  const exec = await jfetch(`${API}/v1/transaction/execute`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      action: 'decrease-position',
+      serializedTxBase64: Buffer.from(tx.serialize()).toString('base64'),
+    }),
+  });
+  if (!exec.data.txid) throw new Error(`jup close execute failed: ${exec.data.message || ''}`);
+  return { sig: exec.data.txid, simulated: false };
 }
