@@ -42,7 +42,8 @@ async function claimAndAllocate() {
     if (slice <= 0) continue;
     const buybackBurn = async () => {
       const { sig } = await buyToken(t.mint, slice);
-      await burnAll(t.mint);
+      const b = await burnAll(t.mint);
+      log('burn', t.mint, b.sig || b.reason, b.error || '');
       const usd = (slice / LAMPORTS_PER_SOL) * solUsd;
       store.recordBurn({ mint: t.mint, market: t.linked || t.underlying, side: 'long', sizeUsd: usd, burnedUsd: usd, tx: sig });
       log('buyback+burn', t.mint, sig, `$${usd.toFixed(2)}`);
