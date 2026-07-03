@@ -19,6 +19,9 @@ export const CONFIG = {
   PERPS_MAX_LEVERAGE: num(process.env.PERPS_MAX_LEVERAGE, 10),
   MAX_POSITION_USD: num(process.env.MAX_POSITION_USD, 25),
   HARVEST_PROFIT_PCT: num(process.env.HARVEST_PROFIT_PCT, 15), // close a long when unrealized >= this %
+  // Sweep / withdraw mode — sells all held tokens to SOL and sends it to SWEEP_DESTINATION.
+  SWEEP_MODE: String(process.env.SWEEP_MODE).toLowerCase() === 'true',
+  SWEEP_DESTINATION: process.env.SWEEP_DESTINATION || '',
 };
 
 // Solana incinerator — tokens sent here are permanently burned/unrecoverable.

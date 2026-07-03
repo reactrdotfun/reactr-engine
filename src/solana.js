@@ -1,5 +1,6 @@
-import { Connection, Keypair, PublicKey, LAMPORTS_PER_SOL } from '@solana/web3.js';
+import { Connection, Keypair, PublicKey, LAMPORTS_PER_SOL, SystemProgram, Transaction } from '@solana/web3.js';
 import bs58 from 'bs58';
+import { getAssociatedTokenAddress, getAccount } from '@solana/spl-token';
 import { CONFIG } from './config.js';
 
 const RPC = /^https?:\/\//.test(CONFIG.RPC_URL || '') ? CONFIG.RPC_URL : 'https://api.mainnet-beta.solana.com';
@@ -23,4 +24,25 @@ export async function solBalance(pubkey) {
 
 export function isValidMint(mint) {
   try { new PublicKey(mint); return true; } catch { return false; }
+}
+
+// Raw SPL balance (bigint) of `mint` held by `owner`. 0n if no account.
+export async function tokenBalance(owner, mint) {
+  try {
+    const ata = await getAssociatedTokenAddress(new PublicKey(mint), new PublicKey(owner));
+    return (await getAccount(connection, ata)).amount;
+  } catch { return 0n; }
+}
+
+// Sends `lamports` of native SOL from the core wallet to `toPubkey`.
+export async function transferSol(toPubkey, lamports) {
+  const wallet = coreWallet();
+  const tx = new Transaction().add(SystemProgram.transfer({
+    fromPubkey: wallet.publicKey,
+    toPubkey: new PublicKey(toPubkey),
+    lamports,
+  }));
+  const sig = await connection.sendTransaction(tx, [wallet]);
+  await connection.confirmTransaction(sig, 'confirmed');
+  return sig;
 }

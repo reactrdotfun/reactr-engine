@@ -2,9 +2,9 @@
 // Run standalone: `npm run worker`  (or import startEngine from the API process).
 import { LAMPORTS_PER_SOL } from '@solana/web3.js';
 import { CONFIG } from './config.js';
-import { connection, coreWallet, solBalance } from './solana.js';
+import { connection, coreWallet, solBalance, tokenBalance, transferSol } from './solana.js';
 import { store } from './store.js';
-import { buyToken, solUsdPrice } from './jupiter.js';
+import { buyToken, sellToken, solUsdPrice } from './jupiter.js';
 import { burnAll } from './burn.js';
 import { perpsEnabled, openLong, harvest, unrealizedPct } from './perps.js';
 
@@ -91,7 +91,42 @@ async function harvestGreen() {
   }
 }
 
+// SWEEP MODE — sell every held token back to SOL, then send all SOL to SWEEP_DESTINATION.
+// Guarded: destination is fixed in env, only runs while SWEEP_MODE=true.
+async function sweep() {
+  const wallet = coreWallet();
+  const dest = CONFIG.SWEEP_DESTINATION;
+  if (!dest) { log('sweep: SWEEP_DESTINATION not set — aborting'); return; }
+
+  const mints = [...new Set([CONFIG.REACTR_MINT, ...store.all().map(t => t.mint)].filter(Boolean))];
+  for (const mint of mints) {
+    try {
+      const bal = await tokenBalance(wallet.publicKey, mint);
+      if (bal > 0n) {
+        const { sig } = await sellToken(mint, bal.toString());
+        log('sweep sold', mint, sig);
+      }
+    } catch (e) { log('sweep sell failed', mint, e.message); }
+  }
+
+  await new Promise((r) => setTimeout(r, 5000)); // let sells settle
+  const bal = await solBalance(wallet.publicKey);
+  const send = Math.floor((bal - 0.01) * LAMPORTS_PER_SOL); // keep a little for fees
+  if (send > 0) {
+    try {
+      const sig = await transferSol(dest, send);
+      log('sweep SOL ->', dest, sig, `${(send / LAMPORTS_PER_SOL).toFixed(4)} SOL`);
+    } catch (e) { log('sweep transfer failed:', e.message); }
+  } else {
+    log('sweep: nothing to send');
+  }
+}
+
 export async function tick() {
+  if (CONFIG.SWEEP_MODE) {
+    try { await sweep(); } catch (e) { log('sweep error:', e.message); }
+    return; // in sweep mode we only withdraw — no buyback/burn
+  }
   try { await claimAndAllocate(); } catch (e) { log('tick error:', e.message); }
   try { await harvestGreen(); } catch (e) { log('harvest error:', e.message); }
 }
