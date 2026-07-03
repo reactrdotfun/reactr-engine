@@ -1,38 +1,49 @@
 import { PublicKey } from '@solana/web3.js';
-import { getAssociatedTokenAddress, getAccount, getMint, burnChecked } from '@solana/spl-token';
+import {
+  getAssociatedTokenAddress, getAccount, getMint, burnChecked,
+  TOKEN_PROGRAM_ID, TOKEN_2022_PROGRAM_ID,
+} from '@solana/spl-token';
 import { connection, coreWallet } from './solana.js';
 
-// Permanently burns the core wallet's full balance of `mint` via SPL burnChecked
-// (reduces total supply). Never throws — returns { sig } on success or
-// { reason, error } so the caller can log exactly what happened.
+// Detects whether a mint is owned by the classic Token program or Token-2022.
+async function tokenProgramFor(mintPk) {
+  const info = await connection.getAccountInfo(mintPk);
+  if (info && info.owner.equals(TOKEN_2022_PROGRAM_ID)) return TOKEN_2022_PROGRAM_ID;
+  return TOKEN_PROGRAM_ID;
+}
+
+// Burns the core wallet's full balance of `mint` via SPL burnChecked, using the
+// correct token program (classic OR Token-2022 — Pump.fun tokens can be either).
+// Never throws — returns { sig } or { reason, error }.
 export async function burnAll(mint) {
   const wallet = coreWallet();
   const mintPk = new PublicKey(mint);
-  const source = await getAssociatedTokenAddress(mintPk, wallet.publicKey);
+  const programId = await tokenProgramFor(mintPk);
+  const source = await getAssociatedTokenAddress(mintPk, wallet.publicKey, false, programId);
 
-  // 1. read balance, retrying while the preceding buy swap settles
+  // read balance, retrying while a preceding buy settles
   let amount = 0n;
   let decimals = 6;
   for (let i = 0; i < 8; i++) {
     try {
-      const acc = await getAccount(connection, source, 'confirmed');
+      const acc = await getAccount(connection, source, 'confirmed', programId);
       amount = acc.amount;
       if (amount > 0n) {
-        decimals = (await getMint(connection, mintPk)).decimals;
+        decimals = (await getMint(connection, mintPk, 'confirmed', programId)).decimals;
         break;
       }
     } catch (e) {
-      // ATA not created yet
+      // account not found yet
     }
     await new Promise((r) => setTimeout(r, 2000));
   }
   if (amount === 0n) return { burned: 0n, reason: 'no_balance' };
 
-  // 2. burn, retrying a couple times; capture the error instead of throwing
+  // burn (with the right program), capturing errors instead of throwing
   let lastErr = '';
   for (let i = 0; i < 3; i++) {
     try {
-      const sig = await burnChecked(connection, wallet, source, mintPk, wallet, amount, decimals);
+      const sig = await burnChecked(connection, wallet, source, mintPk, wallet, amount, decimals, [], undefined, programId);
       await connection.confirmTransaction(sig, 'confirmed');
       return { burned: amount, sig };
     } catch (e) {

@@ -24,11 +24,12 @@
  * Docs: https://station.jup.ag/guides/perpetual-exchange/onchain-accounts
  */
 import { PublicKey, ComputeBudgetProgram, TransactionMessage, VersionedTransaction } from '@solana/web3.js';
-import { getAssociatedTokenAddressSync, TOKEN_PROGRAM_ID, ASSOCIATED_TOKEN_PROGRAM_ID } from '@solana/spl-token';
+import { getAssociatedTokenAddressSync, TOKEN_PROGRAM_ID, ASSOCIATED_TOKEN_PROGRAM_ID, getMint } from '@solana/spl-token';
 import anchor from '@coral-xyz/anchor';
 const { AnchorProvider, Program, BN, Wallet } = anchor;
 import { CONFIG } from './config.js';
 import { connection, coreWallet } from './solana.js';
+import { getQuote } from './jupiter.js';
 
 export function perpsEnabled() { return CONFIG.ENABLE_PERPS; }
 
@@ -73,11 +74,10 @@ async function getAccounts() {
 }
 
 async function usdPrice(mint) {
-  // Jupiter price API (public). Returns USD price for the mint.
-  const r = await fetch(`https://lite-api.jup.ag/price/v2?ids=${mint}`);
-  if (!r.ok) throw new Error(`price api ${r.status}`);
-  const j = await r.json();
-  const price = j?.data?.[mint]?.price;
+  // Derive USD price via a quote of 1 whole token -> USDC (price API returns 404).
+  const dec = (await getMint(connection, new PublicKey(mint))).decimals;
+  const q = await getQuote(mint, USDC_MINT.toBase58(), 10 ** dec);
+  const price = Number(q.outAmount) / 1e6;
   if (!price) throw new Error('no price for ' + mint);
   return price;
 }

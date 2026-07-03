@@ -16,7 +16,7 @@ async function claimAndAllocate() {
   if (bal < CONFIG.FEE_CLAIM_THRESHOLD_SOL) return;
 
   // keep a little SOL for tx fees
-  const spendable = Math.max(0, bal - 0.02);
+  const spendable = Math.max(0, bal - 0.05); // keep buffer for buy+burn tx fees/rent
   if (spendable <= 0) return;
   const solUsd = await solUsdPrice(); // USD value of each buyback
 
