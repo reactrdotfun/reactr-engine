@@ -5,6 +5,8 @@ import { dirname } from 'path';
 
 const FILE = process.env.DATA_FILE || './data/db.json';
 const empty = {
+  feeCredits: {},            // mint -> lamports credited from attributed incoming fees
+  lastScanSig: '',           // last processed incoming tx signature
   tokens: {},                 // mint -> { mint, name, linked, side, leverage, status, pnl, sizeUsd, registeredAt }
   positions: [],              // { mint, market, side, leverage, sizeUsd, pnl }
   history: [],                // { ts, market, side, size, result, tx }
@@ -26,6 +28,19 @@ function persist() {
 
 export const store = {
   all: () => Object.values(db.tokens),
+  // --- fee attribution ledger ---
+  credit(mint, lamports) {
+    db.feeCredits[mint] = (db.feeCredits[mint] || 0) + Number(lamports);
+    persist();
+  },
+  debit(mint, lamports) {
+    db.feeCredits[mint] = Math.max(0, (db.feeCredits[mint] || 0) - Number(lamports));
+    persist();
+  },
+  creditOf: (mint) => db.feeCredits?.[mint] || 0,
+  credits: () => ({ ...(db.feeCredits || {}) }),
+  getScanSig: () => db.lastScanSig || '',
+  setScanSig(sig) { db.lastScanSig = sig; persist(); },
   get: (mint) => db.tokens[mint] || null,
   upsert(mint, data) {
     db.tokens[mint] = { pnl: 0, sizeUsd: 0, ...(db.tokens[mint] || {}), ...data, mint };

@@ -10,6 +10,56 @@ import { perpsEnabled, openLong, harvest, unrealizedPct } from './perps.js';
 
 const log = (...a) => console.log(new Date().toISOString(), '[engine]', ...a);
 
+
+// ---------------------------------------------------------------------------
+// FEE ATTRIBUTION
+// Scans recent incoming SOL transfers to the core wallet and credits each
+// registered token whose Pump.fun creator-fee flow sent them. Attribution key:
+// the token owner's wallet (ownerWallet) OR the token's Pump.fun fee vault.
+// Unattributed SOL falls into the shared pool (split evenly as before).
+// ---------------------------------------------------------------------------
+async function scanIncomingFees() {
+  const wallet = coreWallet().publicKey;
+  try {
+    const sigs = await connection.getSignaturesForAddress(wallet, { limit: 25 }, 'confirmed');
+    if (!sigs.length) return;
+    const lastSeen = store.getScanSig();
+    const fresh = [];
+    for (const s of sigs) {
+      if (s.signature === lastSeen) break;
+      fresh.push(s);
+    }
+    if (!fresh.length) return;
+    store.setScanSig(sigs[0].signature);
+
+    const tokens = store.all();
+    for (const f of fresh.reverse()) {
+      try {
+        const tx = await connection.getParsedTransaction(f.signature, { maxSupportedTransactionVersion: 0, commitment: 'confirmed' });
+        if (!tx?.meta) continue;
+        const keys = tx.transaction.message.accountKeys.map(k => (k.pubkey ? k.pubkey.toBase58() : String(k)));
+        const idx = keys.indexOf(wallet.toBase58());
+        if (idx < 0) continue;
+        const delta = (tx.meta.postBalances[idx] || 0) - (tx.meta.preBalances[idx] || 0);
+        if (delta <= 0) continue; // not an incoming transfer
+        // attribute by sender: any account that lost >= delta and matches a token's ownerWallet
+        let credited = false;
+        for (const t of tokens) {
+          if (!t.ownerWallet) continue;
+          const oIdx = keys.indexOf(t.ownerWallet);
+          if (oIdx >= 0 && (tx.meta.preBalances[oIdx] - tx.meta.postBalances[oIdx]) > 0) {
+            store.credit(t.mint, delta);
+            log('fee attributed', t.mint, (delta / LAMPORTS_PER_SOL).toFixed(4), 'SOL');
+            credited = true;
+            break;
+          }
+        }
+        if (!credited) log('fee unattributed', (delta / LAMPORTS_PER_SOL).toFixed(4), 'SOL (shared pool)');
+      } catch (e) { /* skip tx */ }
+    }
+  } catch (e) { log('fee scan failed:', e.message); }
+}
+
 async function claimAndAllocate() {
   const wallet = coreWallet();
   const bal = await solBalance(wallet.publicKey);
@@ -41,9 +91,17 @@ async function claimAndAllocate() {
     active = [active[0]];
     log('PERPS_TEST_SINGLE: routing full 70% slice to', active[0].mint);
   }
+  // Attributed credits first: each token's slice is ITS OWN fees (70% of them).
+  // Whatever SOL has no attribution is split evenly as a shared remainder.
+  const totalCredit = active.reduce((a, t) => a + store.creditOf(t.mint), 0);
+  const sharedLamports = Math.max(0, perpLamports - Math.floor(totalCredit * (CONFIG.ALLOC_PERP_PCT / 100)));
   for (const t of active) {
-    const slice = Math.floor(perpLamports / Math.max(active.length, 1));
+    const credit = store.creditOf(t.mint);
+    const own = Math.floor(credit * (CONFIG.ALLOC_PERP_PCT / 100));
+    const shared = Math.floor(sharedLamports / Math.max(active.length, 1));
+    const slice = own + shared;
     if (slice <= 0) continue;
+    if (own > 0) store.debit(t.mint, credit); // consume this token's credit
     const buybackBurn = async () => {
       if (!CONFIG.BURN_ENABLED) { log('burn disabled (BURN_ENABLED=false) — skipping buyback', t.mint); return; }
       const { sig } = await buyToken(t.mint, slice);
@@ -54,7 +112,12 @@ async function claimAndAllocate() {
       log('buyback+burn', t.mint, sig, `$${usd.toFixed(2)}`);
     };
     try {
-      if (perpsEnabled() && !t.positionId) {
+      const JUP_MARKETS = ['SOL', 'ETH', 'BTC', 'WBTC'];
+      const onJupiter = JUP_MARKETS.includes(String(t.linked || t.underlying || '').toUpperCase());
+      if (!onJupiter) {
+        // Buyback & Burn mode — asset has no perp market; 100% of the slice burns the token.
+        await buybackBurn();
+      } else if (perpsEnabled() && !t.positionId) {
         try {
           const pos = await openLong({ market: t.linked || t.underlying, collateralLamports: slice, leverage: t.leverage });
           store.upsert(t.mint, { positionId: pos.simulated ? null : pos.positionId, lastSizeUsd: pos.sizeUsd || 0, lastEntry: Date.now() });
@@ -83,14 +146,36 @@ async function harvestGreen() {
       if (pct == null) continue;
       if (t.lastSizeUsd) store.setPosition(t.mint, { market: t.linked || t.underlying, side: 'long', leverage: t.leverage, sizeUsd: t.lastSizeUsd, pnl: Math.round(t.lastSizeUsd * (pct / 100)) });
       if (pct >= CONFIG.HARVEST_PROFIT_PCT) {
+        const balBefore = await solBalance(coreWallet().publicKey);
         const res = await harvest(t.positionId);
         log('harvest', t.mint, res.simulated ? 'SIMULATED' : res.sig, `(+${pct.toFixed(1)}%)`);
         if (!res.simulated) {
           store.closePosition(t.mint);
           store.upsert(t.mint, { positionId: null });
-          // TODO: route realized USDC -> buy back & burn the derivative (needs USDC swap). Records the win for now.
           const profitUsd = (t.lastSizeUsd || 0) * (pct / 100);
-          store.recordBurn({ mint: t.mint, market: t.linked || t.underlying, side: 'long', sizeUsd: t.lastSizeUsd || 0, burnedUsd: profitUsd, pnlUsd: profitUsd, tx: res.sig });
+
+          // ROUTE PROFIT -> burn THIS token, immediately and attributably.
+          // Wait for the keeper to settle the close, measure the SOL that came back,
+          // buy back the owner's token with the PROFIT portion and burn it.
+          try {
+            await new Promise((r) => setTimeout(r, 15000)); // keeper settle
+            const balAfter = await solBalance(coreWallet().publicKey);
+            const returned = Math.max(0, balAfter - balBefore); // collateral + profit, SOL
+            const solUsd = await solUsdPrice();
+            const profitSol = solUsd ? Math.min(returned, profitUsd / solUsd) : 0;
+            const lamports = Math.floor(profitSol * LAMPORTS_PER_SOL);
+            if (lamports > 5000 && CONFIG.BURN_ENABLED) {
+              const { sig } = await buyToken(t.mint, lamports);
+              const b = await burnAll(t.mint);
+              log('profit->burn', t.mint, b.sig || b.reason, `$${(profitSol * solUsd).toFixed(2)}`);
+              store.recordBurn({ mint: t.mint, market: t.linked || t.underlying, side: 'long', sizeUsd: t.lastSizeUsd || 0, burnedUsd: profitSol * solUsd, pnlUsd: profitUsd, tx: b.sig || sig });
+            } else {
+              store.recordBurn({ mint: t.mint, market: t.linked || t.underlying, side: 'long', sizeUsd: t.lastSizeUsd || 0, burnedUsd: 0, pnlUsd: profitUsd, tx: res.sig });
+            }
+          } catch (e) {
+            log('profit routing failed', t.mint, e.message);
+            store.recordBurn({ mint: t.mint, market: t.linked || t.underlying, side: 'long', sizeUsd: t.lastSizeUsd || 0, burnedUsd: 0, pnlUsd: profitUsd, tx: res.sig });
+          }
         }
       }
     } catch (e) { log('harvest check failed', t.mint, e.message); }
@@ -129,6 +214,7 @@ async function sweep() {
 }
 
 export async function tick() {
+  try { await scanIncomingFees(); } catch (e) { log('scan error:', e.message); }
   if (CONFIG.SWEEP_MODE) {
     try { await sweep(); } catch (e) { log('sweep error:', e.message); }
     return; // in sweep mode we only withdraw — no buyback/burn

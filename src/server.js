@@ -75,6 +75,9 @@ app.get('/api/v1/history', (_req, res) =>
 );
 
 // One token's status + position
+app.get('/api/v1/tokens/by-owner/:owner', (req, res) =>
+  res.json(store.all().filter((t) => t.owner === req.params.owner || t.ownerWallet === req.params.owner)));
+
 app.get('/api/v1/tokens/:mint/status', (req, res) => {
   const t = store.get(req.params.mint);
   if (!t) return res.status(404).json({ error: 'not_registered' });
@@ -84,7 +87,7 @@ app.get('/api/v1/tokens/:mint/status', (req, res) => {
 // Register a token with the core
 app.post('/api/v1/tokens/register', async (req, res) => {
   try {
-    const { mint, name, underlying = 'SOL', linked, side = 'long', leverage = 100 } = req.body || {};
+    const { mint, name, underlying = 'SOL', linked, side = 'long', leverage = 100, owner = '', ownerWallet = '' } = req.body || {};
     if (!isValidMint(mint)) return res.status(400).json({ error: 'invalid_mint' });
     if (store.get(mint)) return res.status(409).json({ error: 'already_registered' });
 
@@ -93,6 +96,7 @@ app.post('/api/v1/tokens/register', async (req, res) => {
     if (!v.ok) return res.status(422).json({ error: 'verification_failed', ...v });
 
     const token = store.upsert(mint, {
+      owner, ownerWallet,
       name: name || shortMint(mint),
       linked: linked || underlying,
       side,
